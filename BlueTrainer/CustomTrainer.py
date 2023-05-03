@@ -1,29 +1,48 @@
 import torch
 from torch import nn
 from transformers import Trainer
-from bert_score import score as bert_score
+from bert_score import BERTScorer
+
+from BlueTrainer.TrainingLoop import tokenizer
 
 
 class CustomTrainer(Trainer):
+    """
+       CustomTrainer class is a subclass of the Hugging Face Trainer that modifies the compute_loss
+       method to suit the specific needs of training a code-to-summary and summary-to-code model
+       in a two-step process.
+
+       The class computes a custom loss that consists of three components: summary quality,
+       KL divergence between input and output code, and summary length penalty.
+
+       Attributes:
+           code_to_summary (PreTrainedModel): A pre-trained model for generating summaries from code.
+           summary_to_code (PreTrainedModel): A pre-trained model for generating code from summaries.
+       """
+
+    def __init__(self, code_to_summary, summary_to_code, training_args, *args, **kwargs):
+        super().__init__(model=None, args=training_args, *args, **kwargs)
+        self.code_to_summary = code_to_summary
+        self.summary_to_code = summary_to_code
+
     def compute_loss(self, model, inputs, return_outputs=False):
-        # Input code and target code (assuming they are the same in this case)
+        # Input code
         input_code = inputs.get("input_code")
-        target_code = inputs.get("target_code")
 
         # Forward pass through the code-to-summary model
-        summary_outputs = model.code_to_summary(**inputs)
+        summary_outputs = self.code_to_summary(**inputs)
         summaries = summary_outputs.get("logits")
 
         # Forward pass through the summary-to-code model
-        code_outputs = model.summary_to_code(summaries)
+        code_outputs = self.summary_to_code(summaries)
         generated_code = code_outputs.get("logits")
 
         # Compute BERTScore for summary quality
         with torch.no_grad():
             input_code_strings = tokenizer.batch_decode(input_code, skip_special_tokens=True)
             summaries_strings = tokenizer.batch_decode(summaries, skip_special_tokens=True)
-            P, R, F1 = bert_score(summaries_strings, input_code_strings, model_type="bert-base-uncased",
-                                  device=self.args.device)
+            scorer = BERTScorer(model_type="bert-base-uncased", device=self.args.device)
+            P, R, F1 = scorer.score(summaries_strings, input_code_strings)
 
         summary_quality = F1.mean()
 
