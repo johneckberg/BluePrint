@@ -76,11 +76,14 @@ if not os.path.exists("model_checkpoints"):
     os.makedirs("model_checkpoints")
 
 # Load the GitHub Code dataset and filter for Python code
+# Links: https://huggingface.co/datasets/codeparrot/github-code
 ds = load_dataset("codeparrot/github-code", streaming=True, split="train", languages=["Python"])
 print("Github Loaded")
 
 
 # Load the Alpaca-LoRA Llama models
+# Links: https://huggingface.co/decapoda-research/llama-7b-hf
+# Links: https://huggingface.co/tloen/alpaca-lora-7b
 BASE_MODEL = "decapoda-research/llama-7b-hf"
 LORA_WEIGHTS = "tloen/alpaca-lora-7b"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -120,7 +123,7 @@ for epoch in range(num_epochs):
 
     for batch in train_dataloader:
         # Prepare the input tensors with the prompt "Summarize this code:"
-        # this lack of respect to the prompt format of the alpaca model might fuck this up
+        # this lack of respect to the prompt format of the alpaca model might mess this up, but huggingface did it too
         # & ill just have to use a llama. but I think it will be okay?
         input_code = tokenizer("Summarize this code: " + batch["text"], return_tensors="pt", padding=True)[
             "input_ids"]
@@ -130,7 +133,7 @@ for epoch in range(num_epochs):
         summaries = model.generate_summaries(input_code)
 
         # Update input tensor with the prompt: "Convert this code Summary into the Code it is describing:"
-        summary_prompt = "Convert this code Summary into the Code it is describing: "
+        summary_prompt = "Convert this code Summary into the code it is describing: "
         summaries_with_prompt = tokenizer(summary_prompt, return_tensors="pt", padding=True)["input_ids"]
         summaries_with_prompt = torch.cat([summaries_with_prompt, summaries], dim=1).to(device)
 
