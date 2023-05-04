@@ -1,12 +1,25 @@
-import torch
 import os
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.optim as optim
-from peft import PeftModel
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from peft import PeftModel
 from transformers import LlamaTokenizer, LlamaForCausalLM
 from datasets import load_dataset
 from torch.utils.data import Dataset
+
+
+# The main idea is to use one Alpaca model to generate a summary of a given code snippet
+# and then use another Alpaca model to translate the summary back into code.
+# The model is trained on the GitHub Code dataset filtered for Python code.
+
+
+# use nccl instead of gloo if not running on mac
+# like this can even run on my mac anyways...
 
 
 class StreamingCodeDataset(Dataset):
@@ -21,7 +34,7 @@ class StreamingCodeDataset(Dataset):
     def __getitem__(self, idx):
         item = next(iter(self.dataset.skip(idx).take(1)))
         input_code = self.tokenizer.encode(item['code'], return_tensors='pt')
-        return {'input_code': input_code[0]}
+        return input_code[0]
 
 
 def load_alpaca_lora_llama_model(base_model, lora_weights, device):
@@ -80,7 +93,6 @@ if not os.path.exists("model_checkpoints"):
 ds = load_dataset("codeparrot/github-code", streaming=True, split="train", languages=["Python"])
 print("Github Loaded")
 
-
 # Load the Alpaca-LoRA Llama models
 # Links: https://huggingface.co/decapoda-research/llama-7b-hf
 # Links: https://huggingface.co/tloen/alpaca-lora-7b
@@ -92,12 +104,18 @@ tokenizer = LlamaTokenizer.from_pretrained(BASE_MODEL)
 # Convert the dataset to an iterable format and preprocess the data
 num_samples = 1000
 train_dataset = StreamingCodeDataset(ds, tokenizer, num_samples)
-train_dataloader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+
+os.environ["MASTER_ADDR"] = "localhost"
+os.environ["MASTER_PORT"] = "12355"
+dist.init_process_group("gloo", rank=0, world_size=1) # nccl
+
+train_sampler = DistributedSampler(train_dataset)
+train_dataloader = DataLoader(train_dataset, batch_size=4, shuffle=False, sampler=train_sampler)
 
 model_1 = load_alpaca_lora_llama_model(BASE_MODEL, LORA_WEIGHTS, device)
 model_2 = load_alpaca_lora_llama_model(BASE_MODEL, LORA_WEIGHTS, device)
 model = Code2CodeTranslationModel(model_1, model_2)
-model.to(device)
+# pass model to device when starting loop
 
 # Set up the optimizer and training parameters
 learning_rate = 5e-5
@@ -116,42 +134,57 @@ def custom_loss_function(summary_logits, generated_code_logits, input_code, summ
     return loss
 
 
-# Fine-tuning loop
-for epoch in range(num_epochs):
-    model.train()
-    epoch_loss = 0.0
+def init_process(rank, model, world_size, backend='gloo'):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    dist.init_process_group(backend, rank=rank, world_size=world_size)
 
-    for batch in train_dataloader:
-        # Prepare the input tensors with the prompt "Summarize this code:"
-        # this lack of respect to the prompt format of the alpaca model might mess this up, but huggingface did it too
-        # & ill just have to use a llama. but I think it will be okay?
-        input_code = tokenizer("Summarize this code: " + batch["text"], return_tensors="pt", padding=True)[
-            "input_ids"]
-        input_code = input_code.to(device)
+    model.to(device)
+    model = DDP(model, device_ids=[rank], output_device=rank)
 
-        # Generate summaries with the first Alpaca model
-        summaries = model.generate_summaries(input_code)
+    # Fine-tuning loop
+    for epoch in range(num_epochs):
+        train_sampler.set_epoch(epoch)
+        model.train()
+        epoch_loss = 0.0
 
-        # Update input tensor with the prompt: "Convert this code Summary into the Code it is describing:"
-        summary_prompt = "Convert this code Summary into the code it is describing: "
-        summaries_with_prompt = tokenizer(summary_prompt, return_tensors="pt", padding=True)["input_ids"]
-        summaries_with_prompt = torch.cat([summaries_with_prompt, summaries], dim=1).to(device)
+        for batch in train_dataloader:
+            # Prepare the input tensors with the prompt "Summarize this code:"
+            # this lack of respect to the prompt format of the alpaca model might mess this up
+            # but huggingface staff did it too.
+            # ill just have to use a llama if broken. but I think it will be okay?
+            input_code = tokenizer("Summarize this code: " + batch["text"], return_tensors="pt", padding=True)[
+                "input_ids"]
+            input_code = input_code.to(device)
 
-        # Forward pass
-        summary_logits, generated_code_logits = model(input_code, summaries_with_prompt)
+            # Generate summaries with the first Alpaca model
+            summaries = model.generate_summaries(input_code)
 
-        # Calculate the loss
-        loss = custom_loss_function(summary_logits, generated_code_logits, input_code, summaries, tokenizer)
+            # Update input tensor with the prompt: "Convert this code Summary into the Code it is describing:"
+            summary_prompt = "Convert this code Summary into the code it is describing: "
+            summaries_with_prompt = tokenizer(summary_prompt, return_tensors="pt", padding=True)["input_ids"]
+            summaries_with_prompt = torch.cat([summaries_with_prompt, summaries], dim=1).to(device)
 
-        # Backward pass and optimization
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            # Forward pass with tokenized input
+            summary_logits, generated_code_logits = model(input_code, summaries_with_prompt)
 
-        epoch_loss += loss.item()
+            # Calculate the loss
+            loss = custom_loss_function(summary_logits, generated_code_logits, input_code, summaries, tokenizer)
 
-    print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {epoch_loss / len(train_dataloader)}")
+            # Backward pass and optimization
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-# Save the weights
-save_path = "model_checkpoints/epoch_{}_model.pt".format(epoch + 1)
-torch.save(model.state_dict(), save_path)
+            epoch_loss += loss.item()
+
+        print(f" Epoch: {epoch + 1}/{num_epochs}, Loss: {epoch_loss / len(train_dataloader)}")
+
+    # Save the weights
+    save_path = "model_checkpoints/epoch_{}_model.pt".format(epoch + 1)
+    torch.save(model.state_dict(), save_path)
+
+
+if __name__ == "__main__":
+    world_size = torch.cuda.device_count()
+    mp.spawn(init_process, args=(world_size,), nprocs=world_size, join=True)
