@@ -1,0 +1,24 @@
+Bootstrap: docker
+From: python:3.8
+
+%post
+    apt-get update && apt-get -y upgrade
+    apt-get install -y \
+        wget \
+        build-essential \
+        libssl-dev \
+        libffi-dev \
+        libxml2-dev \
+        libxslt1-dev \
+        zlib1g-dev \
+        python3-dev
+
+    # Install pip
+    curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+    python3 get-pip.py
+
+    # Install the required Python libraries
+    pip install torch
+    pip install transformers
+    pip install datasets
+    pip install git+https://github.com/tloen/peft.git
