@@ -1,66 +1,122 @@
 import torch
+import torch.nn as nn
+import torch.optim as optim
+from peft import PeftModel
+from torch.utils.data import DataLoader
+from transformers import LlamaTokenizer, LlamaForCausalLM
 from datasets import load_dataset
-from transformers import LlamaTokenizer, LlamaForCausalLM, TrainingArguments
-from torch.utils.data import Dataset, DataLoader
-from peft import get_peft_config, get_peft_model, LoraConfig, TaskType
 
-# Load pre-trained models and tokenizers
-from BlueTrainer.CustomTrainer import CustomTrainer
 
-# link: https://huggingface.co/baseten/alpaca-30b
-tokenizer = LlamaTokenizer.from_pretrained("decapoda-research/llama-30b-hf")
-code_to_summary_model = LlamaForCausalLM.from_pretrained("decapoda-research/llama-30b-hf")
-summary_to_code_model = LlamaForCausalLM.from_pretrained("decapoda-research/llama-30b-hf")
 
-# Stream GitHub Code dataset and filter for Python code
-# link: https://huggingface.co/datasets/codeparrot/github-code
+
+def load_alpaca_lora_llama_model(base_model, lora_weights, device):
+    if device == "cuda":
+        model = LlamaForCausalLM.from_pretrained(
+            base_model,
+            load_in_8bit=False,
+            torch_dtype=torch.float16,
+            device_map="auto",
+        )
+        model = PeftModel.from_pretrained(
+            model, lora_weights, torch_dtype=torch.float16, force_download=True
+        )
+    elif device == "mps":
+        model = LlamaForCausalLM.from_pretrained(
+            base_model,
+            device_map={"": device},
+            torch_dtype=torch.float16,
+        )
+        model = PeftModel.from_pretrained(
+            model,
+            lora_weights,
+            device_map={"": device},
+            torch_dtype=torch.float16,
+        )
+    else:
+        model = LlamaForCausalLM.from_pretrained(
+            base_model, device_map={"": device}, low_cpu_mem_usage=True
+        )
+        model = PeftModel.from_pretrained(
+            model,
+            lora_weights,
+            device_map={"": device},
+        )
+    return model
+
+
+class Code2CodeTranslationModel(nn.Module):
+    def __init__(self, model_1, model_2):
+        super().__init__()
+        self.code_to_summary = model_1
+        self.summary_to_code = model_2
+
+    def forward(self, input_code):
+        summary_logits = self.code_to_summary(input_code).logits
+        generated_code_logits = self.summary_to_code(summary_logits).logits
+        return summary_logits, generated_code_logits
+
+
+# Load the GitHub Code dataset and filter for Python code
 ds = load_dataset("codeparrot/github-code", streaming=True, split="train", languages=["Python"])
+print("Github Loaded")
+
+# Convert the dataset to an iterable format and preprocess the data
+num_samples = 1000
+train_dataset = list(ds.take(num_samples))
+train_dataloader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+
+# Load the Alpaca-LoRA Llama models
+BASE_MODEL = "decapoda-research/llama-7b-hf"
+LORA_WEIGHTS = "tloen/alpaca-lora-7b"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+tokenizer = LlamaTokenizer.from_pretrained(BASE_MODEL)
+
+model_1 = load_alpaca_lora_llama_model(BASE_MODEL, LORA_WEIGHTS, device)
+model_2 = load_alpaca_lora_llama_model(BASE_MODEL, LORA_WEIGHTS, device)
+model = Code2CodeTranslationModel(model_1, model_2)
+model.to(device)
+
+# Set up the optimizer and training parameters
+learning_rate = 5e-5
+num_epochs = 5
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
 
-# Custom dataset for prompting alpaca #1
-class CustomDataset(Dataset):
-    def __init__(self, dataset, tokenizer, num_samples=None):
-        self.dataset = dataset
-        self.tokenizer = tokenizer
-        self.num_samples = num_samples
+# Custom loss function
+def custom_loss_function(summary_logits, generated_code_logits, input_code, summaries, tokenizer):
+    summary_quality_loss = nn.CrossEntropyLoss()(summary_logits, summaries)
+    code_similarity_loss = nn.KLDivLoss()(generated_code_logits.log_softmax(dim=-1), input_code.softmax(dim=-1))
+    summary_length_penalty = torch.mean(torch.sum((summaries != tokenizer.pad_token_id).float(), dim=1))
 
-    def __len__(self):
-        return self.num_samples if self.num_samples else len(self.dataset)
-
-    def __getitem__(self, idx):
-        item = next(iter(self.dataset.skip(idx).take(1)))
-        input_text = "summarize the following code: " + item['code']
-        input_code = self.tokenizer.encode(input_text, return_tensors='pt')
-        return {'input_code': input_code[0]}
+    loss = summary_quality_loss + code_similarity_loss + summary_length_penalty
+    return loss
 
 
-# Instantiate custom trainer
-training_args = TrainingArguments(
-    output_dir="./training_output",
-    overwrite_output_dir=True,
-    num_train_epochs=5,
-    per_device_train_batch_size=1,
-    save_steps=10_000,
-    save_total_limit=2,
-    # Add other training arguments as needed
-)
+# Fine-tuning loop
+for epoch in range(num_epochs):
+    model.train()
+    epoch_loss = 0.0
 
-# Prepare the models for PEFT fine-tuning
-peft_config = LoraConfig(
-    task_type=TaskType.SEQ_2_SEQ_LM, inference_mode=False, r=8, lora_alpha=32, lora_dropout=0.1
-)
+    for batch in train_dataloader:
+        # Prepare the input tensors
+        input_code = tokenizer(batch["text"], return_tensors="pt", padding=True)[
+            "input_ids"]  # Change 'input_code' to 'text'
+        input_code = input_code.to(device)
 
-code_to_summary_model = get_peft_model(code_to_summary_model, peft_config)
-summary_to_code_model = get_peft_model(summary_to_code_model, peft_config)
+        # Generate summaries with the first Alpaca model
+        summaries = model.generate_summaries(input_code)
 
-# Train models on data
-num_samples = 1000  # Adjust the number of samples as needed
-train_dataset = CustomDataset(ds, tokenizer, num_samples=num_samples)
-trainer = CustomTrainer(
-    code_to_summary=code_to_summary_model,
-    summary_to_code=summary_to_code_model,
-    training_args=training_args,
-    train_dataset=train_dataset,
-)
+        # Forward pass
+        summary_logits, generated_code_logits = model(input_code, summaries)
 
-trainer.train()
+        # Calculate the loss
+        loss = custom_loss_function(summary_logits, generated_code_logits, input_code, summaries, tokenizer)
+
+        # Backward pass and optimization
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        epoch_loss += loss.item()
+
+    print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {epoch_loss / len(train_dataloader)}")
