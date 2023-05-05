@@ -84,6 +84,15 @@ class Code2CodeTranslationModel(nn.Module):
         return summary_logits, generated_code_logits
 
 
+def save_summaries(summaries, tokenizer, epoch, batch_idx):
+    decoded_summaries = [tokenizer.decode(summary, skip_special_tokens=True) for summary in summaries]
+    save_path = "model_checkpoints/summaries_epoch_{}.txt".format(epoch + 1)
+
+    with open(save_path, "a") as f:
+        for idx, summary in enumerate(decoded_summaries):
+            f.write(f"Batch {batch_idx}, Sample {idx}:\n{summary}\n\n")
+
+
 # Create the 'model_checkpoints' directory if it does not exist
 if not os.path.exists("model_checkpoints"):
     os.makedirs("model_checkpoints")
@@ -126,12 +135,20 @@ optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 # Custom loss function
 # TODO introduce weighting hyperparams
 def custom_loss_function(summary_logits, generated_code_logits, input_code, summaries, tokenizer):
-    summary_quality_loss = nn.CrossEntropyLoss()(summary_logits, summaries)  # exp with bertscore
+    # Calculate the Cross-Entropy Loss between the summary_logits and the ground-truth summaries
+    summary_quality_loss = nn.CrossEntropyLoss()(summary_logits, summaries) #TODO BertScore
+
+    # Calculate the Kullback-Leibler Divergence Loss between the generated_code_logits and the input_code
     code_similarity_loss = nn.KLDivLoss()(generated_code_logits.log_softmax(dim=-1), input_code.softmax(dim=-1))
+
+    # Compute the length penalty for the generated summaries by counting non-padding tokens
     summary_length_penalty = torch.mean(torch.sum((summaries != tokenizer.pad_token_id).float(), dim=1))
 
+    # Combine the three loss components (summary_quality_loss, code_similarity_loss, and summary_length_penalty)
     loss = summary_quality_loss + code_similarity_loss + summary_length_penalty
-    return loss
+
+    return loss  # Return the combined loss
+
 
 
 def init_process(rank, model, world_size, backend='gloo'):
@@ -149,6 +166,7 @@ def init_process(rank, model, world_size, backend='gloo'):
         epoch_loss = 0.0
 
         for batch in train_dataloader:
+            batch_idx = 0
             # Prepare the input tensors with the prompt "Summarize this code:"
             # this lack of respect to the prompt format of the alpaca model might mess this up
             # but huggingface staff did it too.
@@ -159,6 +177,9 @@ def init_process(rank, model, world_size, backend='gloo'):
 
             # Generate summaries with the first Alpaca model
             summaries = model.generate_summaries(input_code)
+
+            # save summaries
+            save_summaries(summaries, tokenizer, epoch, batch_idx)
 
             # Update input tensor with the prompt: "Convert this code Summary into the Code it is describing:"
             summary_prompt = "Convert this code Summary into the code it is describing: "
@@ -177,6 +198,8 @@ def init_process(rank, model, world_size, backend='gloo'):
             optimizer.step()
 
             epoch_loss += loss.item()
+
+            batch_idx += 1
 
         print(f" Epoch: {epoch + 1}/{num_epochs}, Loss: {epoch_loss / len(train_dataloader)}")
 
