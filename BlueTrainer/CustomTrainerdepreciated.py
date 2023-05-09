@@ -3,7 +3,7 @@ from torch import nn
 from transformers import Trainer
 from bert_score import BERTScorer
 
-from BlueTrainer.TrainingLoop import tokenizer
+from BlueTrainer.TrainingLoopdepreciated import tokenizer
 
 
 class CustomTrainer(Trainer):
