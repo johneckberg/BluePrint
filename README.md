@@ -11,11 +11,12 @@ BluePrint is a Python module that utilizes transformers and reinforcement learni
 ## Usage
 
 1. Instantiate the BluePrint class with the appropriate paths to the pre-trained code-to-summary and summary-to-code models.
-2. Train the models using the `train()` method with the desired number of epochs, PPO steps, and supervised steps.
-3. Save the trained models using the `save_models()` method with the output paths.
+  Note that due to the peft process, starting wieghts should not have to be saved as two seperate copies if using the same model.
+4. Train the models using the `train()` method with the desired number of epochs, PPO steps, and supervised steps.
+5. Save the trained models using the `save_models()` method with the output paths.
 
 ```python
-blueprint = BluePrint("path/to/code_to_summary/model", "path/to/summary_to_code/model")
+blueprint = BluePrint("path/to/decapoda-research/llama-7b-hf", "path/to/decapoda-research/llama-7b-hf")
 blueprint.train(num_epochs=3, ppo_steps=10, supervised_steps=10)
 blueprint.save_models("path/to/save/code_to_summary/model", "path/to/save/summary_to_code/model")
 ```
