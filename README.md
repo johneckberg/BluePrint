@@ -1,26 +1,31 @@
-Custom Trainer and Training Loop for Code-to-Summary and Summary-to-Code Models
+# BluePrint
 
-This repository contains a custom trainer and training loop for end-to-end fine-tuning of code-to-summary and summary-to-code models. The custom trainer is designed for use with Hugging Face's Transformers library and PyTorch.
-Features
+BluePrint is a Python module that utilizes transformers and reinforcement learning techniques to improve the performance of code summarization and code generation models. The module trains two models: a code-to-summary model and a summary-to-code model. It combines Proximal Policy Optimization (PPO) with supervised learning to train these models.
 
-    End-to-end fine-tuning of code-to-summary and summary-to-code models
-    Custom loss function with a focus on generating concise, human-readable, and accurate summaries that can effectively recreate the original code
-    BERTScore metric for summary quality evaluation
-    Easy integration with Hugging Face Transformers library and pre-trained models
+## Key Components
 
-Dependencies
+1. **RewardModel**: A class that computes rewards for the PPO algorithm by comparing the generated summary with the actual code and a reference model. The reward function is based on cross-entropy loss, length penalty, and reference model penalty.
+2. **StreamingCodeDataset**: A custom dataset class that efficiently handles large datasets using the Hugging Face datasets library, making it suitable for training on large code datasets like the GitHub Code dataset.
+3. **BluePrint**: The main class responsible for training and saving the models. It initializes the models, loads the GitHub Code dataset, configures the PPO algorithm, and sets up the learning rate scheduler and optimizer. The `train()` method handles the training loop, while `save_models()` saves the trained models.
 
-    Python 3.6 or higher
-    PyTorch 1.9.0 or higher
-    Transformers 4.0.0 or higher
-    bert-score 0.3.10 or higher
+## Usage
 
-Installation
+1. Instantiate the BluePrint class with the appropriate paths to the pre-trained code-to-summary and summary-to-code models.
+2. Train the models using the `train()` method with the desired number of epochs, PPO steps, and supervised steps.
+3. Save the trained models using the `save_models()` method with the output paths.
 
-Clone this repository and install the required dependencies:
+```python
+blueprint = BluePrint("path/to/code_to_summary/model", "path/to/summary_to_code/model")
+blueprint.train(num_epochs=3, ppo_steps=10, supervised_steps=10)
+blueprint.save_models("path/to/save/code_to_summary/model", "path/to/save/summary_to_code/model")
+```
 
-bash
+## Dependencies
 
-git clone https://github.com/your-username/custom-trainer.git
-cd custom-trainer
-pip install -r requirements.txt
+- torch
+- transformers
+- trl
+- peft
+- huggingface/datasets
+
+Make sure to install the required packages before running the code.
